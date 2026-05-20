@@ -26,10 +26,30 @@ jobs:
       packages: write
 
     steps:
+      # Keep this workflow free of JavaScript actions so it does not depend on
+      # GitHub's Node runtime lifecycle (Node 20/24 deprecations, forced upgrades).
       - name: Checkout requested ref
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.ref || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="${{ github.event.inputs.ref || github.ref_name }}"
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+
+          if git fetch --depth=1 origin "$ref"; then
+            git checkout --detach FETCH_HEAD
+          elif git fetch --depth=1 origin "refs/heads/$ref"; then
+            git checkout --detach FETCH_HEAD
+          elif git fetch --depth=1 origin "refs/tags/$ref"; then
+            git checkout --detach FETCH_HEAD
+          else
+            echo "Could not fetch ref: $ref" >&2
+            exit 1
+          fi
+
+          checkout_sha="$(git rev-parse HEAD)"
+          echo "CHECKOUT_SHA=$checkout_sha" >> "$GITHUB_ENV"
+          echo "Checked out $ref at $checkout_sha"
 
       - name: Derive image metadata
         shell: bash
@@ -40,35 +60,33 @@ jobs:
           # GHCR/Docker tags cannot contain slashes or arbitrary punctuation.
           safe_tag=$(echo "$tag" | tr '[:upper:]' '[:lower:]' | sed -E 's|[^a-z0-9._-]+|-|g; s|^-+||; s|-+$||')
           [ -n "$safe_tag" ] || safe_tag="manual"
+          sha_tag="sha-${CHECKOUT_SHA:0:12}"
           echo "IMAGE_NAME=$image" >> "$GITHUB_ENV"
           echo "IMAGE_TAG=$safe_tag" >> "$GITHUB_ENV"
           echo "IMAGE_REF=$image:$safe_tag" >> "$GITHUB_ENV"
-          echo "Building $image:$safe_tag from ${{ github.event.inputs.ref || github.ref_name }}"
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+          echo "SHA_IMAGE_REF=$image:$sha_tag" >> "$GITHUB_ENV"
+          echo "Building $image:$safe_tag from $CHECKOUT_SHA"
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
+        shell: bash
+        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64
-          push: true
-          tags: |
-            ${{ env.IMAGE_REF }}
-            ${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
-          labels: |
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx version
+          docker buildx create --name ghcr-builder --use 2>/dev/null || docker buildx use ghcr-builder
+          docker buildx inspect --bootstrap
+          docker buildx build \
+            --platform linux/amd64 \
+            --push \
+            --tag "$IMAGE_REF" \
+            --tag "$SHA_IMAGE_REF" \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${CHECKOUT_SHA}" \
+            .
 
       - name: Summary
-        run: echo "Published $IMAGE_REF" >> "$GITHUB_STEP_SUMMARY"
+        shell: bash
+        run: echo "Published $IMAGE_REF and $SHA_IMAGE_REF" >> "$GITHUB_STEP_SUMMARY"
